@@ -106,7 +106,9 @@ class GradCAM:
         self.hook.remove()
 
 # ── Score-CAM (STABLE VERSION) ─────────────────────────────
-def score_cam(model, x, class_idx, device):
+
+
+ def score_cam(model, x, class_idx, device):
     model.eval()
     activations = []
 
@@ -119,20 +121,27 @@ def score_cam(model, x, class_idx, device):
 
     handle.remove()
 
-    acts = activations[0][0].cpu()
+    acts = activations[0][0].detach().cpu()
 
     cam = torch.zeros((DISP_SIZE, DISP_SIZE))
 
-    for i in range(min(10, acts.shape[0])):  # reduced for stability
+    for i in range(min(10, acts.shape[0])):
+
         a = acts[i]
-        a = F.interpolate(a.unsqueeze(0).unsqueeze(0),
-                          size=(DISP_SIZE, DISP_SIZE),
-                          mode='bilinear').squeeze()
+
+        a = F.interpolate(
+            a.unsqueeze(0).unsqueeze(0),
+            size=(DISP_SIZE, DISP_SIZE),
+            mode='bilinear'
+        ).squeeze()
 
         a = (a - a.min()) / (a.max() + 1e-8)
 
+        # 🔥 FIX HERE (CRITICAL)
+        a_3ch = a.unsqueeze(0).repeat(3, 1, 1)   # [3,H,W]
+
         x_mask = x.clone()
-        x_mask = x_mask * a.to(device)
+        x_mask = x_mask * a_3ch.to(device)
 
         with torch.no_grad():
             score = F.softmax(model(x_mask), dim=1)[0, class_idx].item()
@@ -143,7 +152,7 @@ def score_cam(model, x, class_idx, device):
     cam = np.maximum(cam, 0)
     cam = (cam - cam.min()) / (cam.max() + 1e-8)
 
-    return cam
+    return cam   
 
 # ── Helpers ────────────────────────────────────────────────
 def to_heatmap(x):
