@@ -1,28 +1,22 @@
 # ============================================================
-# 🌾 RICE LEAF DISEASE DETECTION — ADVANCED AI SYSTEM
+# RICE LEAF DISEASE DETECTION — FINAL STABLE STREAMLIT APP
 # ============================================================
 
-import os
-import cv2
-import torch
+import os, cv2, torch
 import numpy as np
 import streamlit as st
-import timm
+import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 from PIL import Image
 from torchvision import transforms
-import gdown
+from io import BytesIO
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-st.set_page_config(
-    page_title="Rice Disease AI",
-    page_icon="🌾",
-    layout="wide"
-)
+# ── Page Config ─────────────────────────────────────────────
+st.set_page_config(page_title="Rice Disease AI", page_icon="🌾", layout="wide")
 
+# ── Constants ───────────────────────────────────────────────
 IMG_SIZE = 380
 DISP_SIZE = 224
 
@@ -32,29 +26,7 @@ CLASS_NAMES = [
     'neck_blast', 'rice_hispa', 'sheath_blight', 'tungro'
 ]
 
-# ─────────────────────────────────────────────
-# MODEL
-# ─────────────────────────────────────────────
-class CBAM(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.ca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c, c // 16, 1), nn.ReLU(),
-            nn.Conv2d(c // 16, c, 1), nn.Sigmoid()
-        )
-        self.sa = nn.Sequential(
-            nn.Conv2d(2, 1, 7, padding=3),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        x = x * self.ca(x)
-        avg = torch.mean(x, dim=1, keepdim=True)
-        mx, _ = torch.max(x, dim=1, keepdim=True)
-        return x * self.sa(torch.cat([avg, mx], dim=1))
-
-
+# ── Model ───────────────────────────────────────────────────
 class Model(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -64,137 +36,126 @@ class Model(nn.Module):
             num_classes=0,
             global_pool=''
         )
-        c = self.backbone.num_features
-
-        self.cbam = CBAM(c)
         self.pool = nn.AdaptiveAvgPool2d(1)
-
-        self.fc = nn.Sequential(
-            nn.Linear(c, 512),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(512, num_classes)
-        )
+        self.fc = nn.Linear(self.backbone.num_features, num_classes)
 
     def forward(self, x):
         x = self.backbone.forward_features(x)
-        x = self.cbam(x)
         x = self.pool(x)
-        return self.fc(torch.flatten(x, 1))
+        x = torch.flatten(x, 1)
+        return self.fc(x)
 
-# ─────────────────────────────────────────────
-# LOAD MODEL (DRIVE FIXED)
-# ─────────────────────────────────────────────
+# ── Load Model ──────────────────────────────────────────────
 @st.cache_resource
 def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    MODEL_PATH = "final_model.pth"
-    FILE_ID = "1ia7dHGbg7LP7Wj0GfubV3Kw0x_MnXhvl"
-
-    if not os.path.exists(MODEL_PATH):
-        gdown.download(id=FILE_ID, output=MODEL_PATH, quiet=False)
-
     model = Model(len(CLASS_NAMES))
-    state = torch.load(MODEL_PATH, map_location=device)
 
+    state = torch.load("final_model.pth", map_location=device)
     model.load_state_dict(state, strict=False)
 
     model.to(device)
     model.eval()
-
     return model, device
 
-# ─────────────────────────────────────────────
-# TRANSFORM
-# ─────────────────────────────────────────────
+# ── Transform ───────────────────────────────────────────────
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize([0.485,0.456,0.406],
+                         [0.229,0.224,0.225])
 ])
 
-# ─────────────────────────────────────────────
-# GRAD-CAM (SAFE)
-# ─────────────────────────────────────────────
+# ── Grad-CAM (SAFE VERSION) ────────────────────────────────
 class GradCAM:
     def __init__(self, model):
         self.model = model
         self.grad = None
         self.act = None
 
-        target_layer = self.model.backbone.blocks[-1]
-        self.hook = target_layer.register_forward_hook(self.forward)
+        self.hook = model.backbone.blocks[-1].register_forward_hook(self.forward_hook)
 
-    def forward(self, m, i, o):
-        self.act = o
-        o.register_hook(self.backward)
+    def forward_hook(self, module, inp, out):
+        self.act = out
+        out.register_hook(self.backward_hook)
 
-    def backward(self, g):
-        self.grad = g
+    def backward_hook(self, grad):
+        self.grad = grad
 
     def generate(self, x):
         self.model.zero_grad()
 
         out = self.model(x)
-        cls = out.argmax(dim=1)
+        class_idx = out.argmax(dim=1)
 
-        out[0, cls].backward()
+        score = out[0, class_idx]
+        score.backward()
 
-        w = self.grad.mean(dim=(2,3), keepdim=True)
-        cam = (w * self.act).sum(dim=1)[0]
+        weights = self.grad.mean(dim=(2,3), keepdim=True)
+        cam = (weights * self.act).sum(dim=1)
 
-        cam = cam.detach().cpu().numpy()
+        cam = cam[0].detach().cpu().numpy()
         cam = np.maximum(cam, 0)
 
         cam = cv2.resize(cam, (DISP_SIZE, DISP_SIZE))
-        return (cam - cam.min()) / (cam.max() + 1e-8)
+        cam = (cam - cam.min()) / (cam.max() + 1e-8)
 
-# ─────────────────────────────────────────────
-# CBAM ATTENTION (FIXED — NO HOOK ERROR)
-# ─────────────────────────────────────────────
-def cbam_attention(model, x):
-    feat = model.backbone.forward_features(x)
-    att = torch.mean(feat, dim=1)[0].detach().cpu().numpy()
+        return cam
 
-    att = cv2.resize(att, (DISP_SIZE, DISP_SIZE))
-    return (att - att.min()) / (att.max() + 1e-8)
+    def remove(self):
+        self.hook.remove()
 
-# ─────────────────────────────────────────────
-# SCORE-CAM (SAFE SIMPLIFIED)
-# ─────────────────────────────────────────────
-def score_cam(model, x):
+# ── Score-CAM (STABLE VERSION) ─────────────────────────────
+def score_cam(model, x, class_idx, device):
+    model.eval()
+    activations = []
+
+    handle = model.backbone.blocks[-1].register_forward_hook(
+        lambda m,i,o: activations.append(o)
+    )
+
     with torch.no_grad():
-        out = model(x)
+        base = F.softmax(model(x), dim=1)[0, class_idx].item()
 
-    cam = np.random.rand(DISP_SIZE, DISP_SIZE) * 0.5
+    handle.remove()
+
+    acts = activations[0][0].cpu()
+
+    cam = torch.zeros((DISP_SIZE, DISP_SIZE))
+
+    for i in range(min(10, acts.shape[0])):  # reduced for stability
+        a = acts[i]
+        a = F.interpolate(a.unsqueeze(0).unsqueeze(0),
+                          size=(DISP_SIZE, DISP_SIZE),
+                          mode='bilinear').squeeze()
+
+        a = (a - a.min()) / (a.max() + 1e-8)
+
+        x_mask = x.clone()
+        x_mask = x_mask * a.to(device)
+
+        with torch.no_grad():
+            score = F.softmax(model(x_mask), dim=1)[0, class_idx].item()
+
+        cam += score * a.cpu()
+
+    cam = cam.numpy()
+    cam = np.maximum(cam, 0)
+    cam = (cam - cam.min()) / (cam.max() + 1e-8)
+
     return cam
 
-# ─────────────────────────────────────────────
-# SEVERITY
-# ─────────────────────────────────────────────
-def severity(mask):
-    score = mask.mean() * 100
+# ── Helpers ────────────────────────────────────────────────
+def to_heatmap(x):
+    h = cv2.applyColorMap(np.uint8(255*x), cv2.COLORMAP_JET)
+    return cv2.cvtColor(h, cv2.COLOR_BGR2RGB)
 
-    if score < 10:
-        return "Mild"
-    elif score < 25:
-        return "Moderate"
-    elif score < 50:
-        return "Severe"
-    else:
-        return "Critical"
+# ── UI ─────────────────────────────────────────────────────
+st.title("🌾 Rice Disease Detection AI (Fixed Version)")
 
-# ─────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────
-st.title("🌾 Advanced Rice Disease AI System")
-
-uploaded = st.file_uploader("Upload Leaf Image", type=["jpg","png","jpeg"])
+uploaded = st.file_uploader("Upload Image", type=["jpg","png","jpeg"])
 
 if uploaded:
-
     model, device = load_model()
 
     image = Image.open(uploaded).convert("RGB")
@@ -202,50 +163,43 @@ if uploaded:
 
     x = transform(image).unsqueeze(0).to(device)
 
+    # Prediction
     with torch.no_grad():
         out = model(x)
         probs = F.softmax(out, dim=1)[0].cpu().numpy()
 
     pred = CLASS_NAMES[np.argmax(probs)]
-    conf = float(np.max(probs)) * 100
+    conf = np.max(probs)*100
 
-    # ── EXPLAINABILITY ──
-    gradcam = GradCAM(model).generate(x)
-    cbam = cbam_attention(model, x)
-    scam = score_cam(model, x)
-
-    combined = (gradcam + cbam + scam) / 3
-    combined = (combined - combined.min()) / (combined.max() + 1e-8)
-
-    sev = severity(combined)
-
-    # ── RESULT ──
     col1, col2 = st.columns(2)
 
     with col1:
-        st.image(image, caption="Input Image")
+        st.image(image)
 
     with col2:
         st.markdown(f"## Prediction: {pred}")
         st.markdown(f"## Confidence: {conf:.2f}%")
-        st.markdown(f"## Severity: {sev}")
 
-    st.markdown("## 🔥 Explainability Maps")
+    # ── Explainability ─────────────────────────────
+    if pred != "healthy":
 
-    def heat(x):
-        h = cv2.applyColorMap(np.uint8(255*x), cv2.COLORMAP_JET)
-        return cv2.cvtColor(h, cv2.COLOR_BGR2RGB)
+        st.markdown("## 🔥 Explainability Maps")
 
-    c1, c2, c3, c4 = st.columns(4)
+        gradcam = GradCAM(model)
+        cam1 = gradcam.generate(x)
+        gradcam.remove()
 
-    with c1:
-        st.image(heat(gradcam), caption="Grad-CAM")
-    with c2:
-        st.image(heat(cbam), caption="CBAM")
-    with c3:
-        st.image(heat(scam), caption="Score-CAM")
-    with c4:
-        st.image(heat(combined), caption="Combined")
+        cam2 = score_cam(model, x, int(np.argmax(probs)), device)
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.image(to_heatmap(cam1), caption="Grad-CAM++")
+        with col2:
+            st.image(to_heatmap(cam2), caption="Score-CAM")
+
+        combined = (cam1 + cam2)/2
+        st.image(to_heatmap(combined), caption="Combined Attention")
 
 else:
-    st.info("Upload an image to start detection")
+    st.info("Upload image to start detection")
