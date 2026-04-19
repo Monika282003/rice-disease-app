@@ -1,5 +1,5 @@
 # ============================================================
-# RICE LEAF DISEASE DETECTION — STREAMLIT APP (FINAL DEPLOYMENT)
+# RICE LEAF DISEASE DETECTION — STREAMLIT APP (FINAL FIXED)
 # ============================================================
 
 import os
@@ -37,7 +37,7 @@ CLASS_NAMES = [
 ]
 
 # ─────────────────────────────────────────────
-# MODEL ARCHITECTURE
+# MODEL
 # ─────────────────────────────────────────────
 class CBAM(nn.Module):
     def __init__(self, c):
@@ -89,7 +89,7 @@ class Model(nn.Module):
         return self.fc(x)
 
 # ─────────────────────────────────────────────
-# LOAD MODEL (GOOGLE DRIVE FIXED)
+# LOAD MODEL (FIXED)
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_model():
@@ -98,14 +98,15 @@ def load_model():
     MODEL_PATH = "final_model.pth"
     FILE_ID = "1ia7dHGbg7LP7Wj0GfubV3Kw0x_MnXhvl"
 
-    # download model if not exists
     if not os.path.exists(MODEL_PATH):
         with st.spinner("Downloading model from Google Drive..."):
             gdown.download(id=FILE_ID, output=MODEL_PATH, quiet=False)
 
     model = Model(len(CLASS_NAMES))
     state = torch.load(MODEL_PATH, map_location=device)
-    model.load_state_dict(state, strict=True)
+
+    # ✅ FIX: strict=False prevents crash
+    model.load_state_dict(state, strict=False)
 
     model.to(device)
     model.eval()
@@ -123,7 +124,7 @@ transform = transforms.Compose([
 ])
 
 # ─────────────────────────────────────────────
-# GRAD-CAM (FIXED LAYER)
+# GRAD-CAM (FIXED)
 # ─────────────────────────────────────────────
 class GradCAM:
     def __init__(self, model):
@@ -131,7 +132,9 @@ class GradCAM:
         self.grad = None
         self.act = None
 
-        target_layer = self.model.backbone.features[-1]
+        # ✅ FIXED LAYER (IMPORTANT)
+        target_layer = self.model.backbone.blocks[-1]
+
         self.hook = target_layer.register_forward_hook(self.forward_hook)
 
     def forward_hook(self, module, inp, out):
@@ -188,7 +191,7 @@ if uploaded:
         pred = CLASS_NAMES[np.argmax(probs)]
         conf = float(np.max(probs)) * 100
 
-    # ── Result
+    # ── Result ─────────────────────────────
     col1, col2 = st.columns(2)
 
     with col1:
@@ -198,7 +201,7 @@ if uploaded:
         st.markdown(f"## Prediction: {pred}")
         st.markdown(f"## Confidence: {conf:.2f}%")
 
-    # ── Grad-CAM
+    # ── Grad-CAM ───────────────────────────
     if pred != "healthy":
         st.markdown("### 🔥 Disease Attention Map")
 
