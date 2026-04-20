@@ -1,9 +1,9 @@
 # ============================================================
-# 🌾 RICE LEAF DISEASE DETECTION — FINAL STABLE VERSION
-# EfficientNet-B4 + CBAM + GradCAM++ + ScoreCAM
+# 🌾 RICE LEAF DISEASE DETECTION — FINAL DEPLOYABLE VERSION
+# EfficientNet-B4 + CBAM + GAP + MLP
 # ============================================================
 
-import os, cv2, torch
+import os, cv2, torch, requests
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -12,17 +12,13 @@ import torch.nn.functional as F
 import timm
 from PIL import Image
 from torchvision import transforms
-from datetime import datetime
 
 # ─────────────────────────────────────────────
-# PAGE CONFIG
+# CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Rice Disease AI", layout="wide")
 st.title("🌾 Rice Leaf Disease Detection")
 
-# ─────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────
 IMG_SIZE = 380
 DISP_SIZE = 224
 
@@ -43,7 +39,7 @@ transform = transforms.Compose([
 ])
 
 # ─────────────────────────────────────────────
-# CBAM BLOCK
+# CBAM
 # ─────────────────────────────────────────────
 class CBAM(nn.Module):
     def __init__(self, channels):
@@ -64,8 +60,7 @@ class CBAM(nn.Module):
         x = x * self.ca(x)
         avg = torch.mean(x, dim=1, keepdim=True)
         mx,_ = torch.max(x, dim=1, keepdim=True)
-        x = x * self.sa(torch.cat([avg,mx], dim=1))
-        return x
+        return x * self.sa(torch.cat([avg,mx], dim=1))
 
 # ─────────────────────────────────────────────
 # MODEL
@@ -79,6 +74,7 @@ class Model(nn.Module):
             num_classes=0,
             global_pool=''
         )
+
         ch = self.backbone.num_features
 
         self.cbam = CBAM(ch)
@@ -86,9 +82,15 @@ class Model(nn.Module):
 
         self.fc = nn.Sequential(
             nn.Linear(ch,512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512,num_classes)
+
+            nn.Linear(512,256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
@@ -99,15 +101,32 @@ class Model(nn.Module):
         return self.fc(x)
 
 # ─────────────────────────────────────────────
-# LOAD MODEL (FIXED VERSION)
+# LOAD MODEL FROM GOOGLE DRIVE
 # ─────────────────────────────────────────────
+MODEL_URL = "https://drive.google.com/uc?id=1ia7dHGbg7LP7Wj0GfubV3Kw0x_MnXhvl"
+
 @st.cache_resource
 def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = Model(len(CLASS_NAMES))
 
-    # SAFE LOADING
-    state = torch.load("final_model.pth", map_location=device)
+    model_path = "final_model.pth"
+
+    # Download if not exists
+    if not os.path.exists(model_path):
+        with st.spinner("📥 Downloading model... Please wait"):
+            r = requests.get(MODEL_URL, stream=True)
+            if r.status_code != 200:
+                st.error("❌ Failed to download model")
+                st.stop()
+
+            with open(model_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+    # Load weights
+    state = torch.load(model_path, map_location=device)
     model.load_state_dict(state, strict=False)
 
     model.to(device)
@@ -115,6 +134,7 @@ def load_model():
 
     return model, device
 
+# ✅ IMPORTANT
 model, device = load_model()
 
 # ─────────────────────────────────────────────
@@ -155,9 +175,9 @@ class GradCAMPlusPlus:
         return cam
 
 # ─────────────────────────────────────────────
-# MAIN UI
+# UI
 # ─────────────────────────────────────────────
-uploaded = st.file_uploader("Upload rice leaf image", type=["jpg","png"])
+uploaded = st.file_uploader("📤 Upload Rice Leaf Image", type=["jpg","png","jpeg"])
 
 if uploaded:
     image = Image.open(uploaded).convert("RGB")
@@ -172,10 +192,10 @@ if uploaded:
     pred = CLASS_NAMES[np.argmax(probs)]
     conf = np.max(probs) * 100
 
-    st.success(f"Prediction: {pred}")
+    st.success(f"Prediction: {pred.replace('_',' ').title()}")
     st.info(f"Confidence: {conf:.2f}%")
 
-    # ── GradCAM ──
+    # Grad-CAM
     cam_extractor = GradCAMPlusPlus(model, model.backbone.blocks[-1])
     cam = cam_extractor.generate(x)
 
@@ -193,4 +213,4 @@ if uploaded:
 # FOOTER
 # ─────────────────────────────────────────────
 st.markdown("---")
-st.caption("EfficientNet-B4 + CBAM + GradCAM++")
+st.caption("EfficientNet-B4 + CBAM + GAP + MLP | Grad-CAM++")
