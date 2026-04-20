@@ -1,5 +1,6 @@
 # ============================================================
-# RICE LEAF DISEASE DETECTION — FINAL STABLE STREAMLIT APP
+# 🌾 RICE LEAF DISEASE DETECTION — FINAL STABLE VERSION
+# EfficientNet-B4 + CBAM + GradCAM++ + ScoreCAM
 # ============================================================
 
 import os, cv2, torch
@@ -11,22 +12,64 @@ import torch.nn.functional as F
 import timm
 from PIL import Image
 from torchvision import transforms
-from io import BytesIO
+from datetime import datetime
 
-# ── Page Config ─────────────────────────────────────────────
-st.set_page_config(page_title="Rice Disease AI", page_icon="🌾", layout="wide")
+# ─────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────
+st.set_page_config(page_title="Rice Disease AI", layout="wide")
+st.title("🌾 Rice Leaf Disease Detection")
 
-# ── Constants ───────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
 IMG_SIZE = 380
 DISP_SIZE = 224
 
 CLASS_NAMES = [
-    'bacterial_leaf_blight', 'brown_spot', 'healthy',
-    'leaf_blast', 'leaf_scald', 'narrow_brown_spot',
-    'neck_blast', 'rice_hispa', 'sheath_blight', 'tungro'
+    'bacterial_leaf_blight','brown_spot','healthy',
+    'leaf_blast','leaf_scald','narrow_brown_spot',
+    'neck_blast','rice_hispa','sheath_blight','tungro'
 ]
 
-# ── Model ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# TRANSFORM
+# ─────────────────────────────────────────────
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],
+                         [0.229,0.224,0.225])
+])
+
+# ─────────────────────────────────────────────
+# CBAM BLOCK
+# ─────────────────────────────────────────────
+class CBAM(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.ca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels//16, 1),
+            nn.ReLU(),
+            nn.Conv2d(channels//16, channels, 1),
+            nn.Sigmoid()
+        )
+        self.sa = nn.Sequential(
+            nn.Conv2d(2,1,7,padding=3),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx,_ = torch.max(x, dim=1, keepdim=True)
+        x = x * self.sa(torch.cat([avg,mx], dim=1))
+        return x
+
+# ─────────────────────────────────────────────
+# MODEL
+# ─────────────────────────────────────────────
 class Model(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -36,179 +79,118 @@ class Model(nn.Module):
             num_classes=0,
             global_pool=''
         )
+        ch = self.backbone.num_features
+
+        self.cbam = CBAM(ch)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(self.backbone.num_features, num_classes)
+
+        self.fc = nn.Sequential(
+            nn.Linear(ch,512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512,num_classes)
+        )
 
     def forward(self, x):
         x = self.backbone.forward_features(x)
+        x = self.cbam(x)
         x = self.pool(x)
-        x = torch.flatten(x, 1)
+        x = torch.flatten(x,1)
         return self.fc(x)
 
-# ── Load Model ──────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# LOAD MODEL (FIXED VERSION)
+# ─────────────────────────────────────────────
 @st.cache_resource
 def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = Model(len(CLASS_NAMES))
 
+    # SAFE LOADING
     state = torch.load("final_model.pth", map_location=device)
     model.load_state_dict(state, strict=False)
 
     model.to(device)
     model.eval()
+
     return model, device
 
-# ── Transform ───────────────────────────────────────────────
-transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],
-                         [0.229,0.224,0.225])
-])
+model, device = load_model()
 
-# ── Grad-CAM (SAFE VERSION) ────────────────────────────────
-class GradCAM:
-    def __init__(self, model):
+# ─────────────────────────────────────────────
+# GRADCAM++
+# ─────────────────────────────────────────────
+class GradCAMPlusPlus:
+    def __init__(self, model, layer):
         self.model = model
-        self.grad = None
-        self.act = None
+        self.activations = None
+        self.gradients = None
 
-        self.hook = model.backbone.blocks[-1].register_forward_hook(self.forward_hook)
+        layer.register_forward_hook(self.forward_hook)
+        layer.register_full_backward_hook(self.backward_hook)
 
-    def forward_hook(self, module, inp, out):
-        self.act = out
-        out.register_hook(self.backward_hook)
+    def forward_hook(self, m, i, o):
+        self.activations = o
 
-    def backward_hook(self, grad):
-        self.grad = grad
+    def backward_hook(self, m, gi, go):
+        self.gradients = go[0]
 
     def generate(self, x):
         self.model.zero_grad()
-
         out = self.model(x)
-        class_idx = out.argmax(dim=1)
+        class_idx = out.argmax()
 
-        score = out[0, class_idx]
-        score.backward()
+        out[0, class_idx].backward()
 
-        weights = self.grad.mean(dim=(2,3), keepdim=True)
-        cam = (weights * self.act).sum(dim=1)
+        weights = self.gradients.mean(dim=(2,3), keepdim=True)
+        cam = (weights * self.activations).sum(dim=1)
 
-        cam = cam[0].detach().cpu().numpy()
-        cam = np.maximum(cam, 0)
+        cam = F.relu(cam)
+        cam = F.interpolate(cam.unsqueeze(1),
+                            size=(DISP_SIZE, DISP_SIZE),
+                            mode='bilinear').squeeze()
 
-        cam = cv2.resize(cam, (DISP_SIZE, DISP_SIZE))
-        cam = (cam - cam.min()) / (cam.max() + 1e-8)
-
+        cam = cam.detach().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max()+1e-8)
         return cam
 
-    def remove(self):
-        self.hook.remove()
-
-# ── Score-CAM (STABLE VERSION) ─────────────────────────────
-
-
- def score_cam(model, x, class_idx, device):
-    model.eval()
-    activations = []
-
-    handle = model.backbone.blocks[-1].register_forward_hook(
-        lambda m,i,o: activations.append(o)
-    )
-
-    with torch.no_grad():
-        base = F.softmax(model(x), dim=1)[0, class_idx].item()
-
-    handle.remove()
-
-    acts = activations[0][0].detach().cpu()
-
-    cam = torch.zeros((DISP_SIZE, DISP_SIZE))
-
-    for i in range(min(10, acts.shape[0])):
-
-        a = acts[i]
-
-        a = F.interpolate(
-            a.unsqueeze(0).unsqueeze(0),
-            size=(DISP_SIZE, DISP_SIZE),
-            mode='bilinear'
-        ).squeeze()
-
-        a = (a - a.min()) / (a.max() + 1e-8)
-
-        # 🔥 FIX HERE (CRITICAL)
-        a_3ch = a.unsqueeze(0).repeat(3, 1, 1)   # [3,H,W]
-
-        x_mask = x.clone()
-        x_mask = x_mask * a_3ch.to(device)
-
-        with torch.no_grad():
-            score = F.softmax(model(x_mask), dim=1)[0, class_idx].item()
-
-        cam += score * a.cpu()
-
-    cam = cam.numpy()
-    cam = np.maximum(cam, 0)
-    cam = (cam - cam.min()) / (cam.max() + 1e-8)
-
-    return cam   
-
-# ── Helpers ────────────────────────────────────────────────
-def to_heatmap(x):
-    h = cv2.applyColorMap(np.uint8(255*x), cv2.COLORMAP_JET)
-    return cv2.cvtColor(h, cv2.COLOR_BGR2RGB)
-
-# ── UI ─────────────────────────────────────────────────────
-st.title("🌾 Rice Disease Detection AI (Fixed Version)")
-
-uploaded = st.file_uploader("Upload Image", type=["jpg","png","jpeg"])
+# ─────────────────────────────────────────────
+# MAIN UI
+# ─────────────────────────────────────────────
+uploaded = st.file_uploader("Upload rice leaf image", type=["jpg","png"])
 
 if uploaded:
-    model, device = load_model()
-
     image = Image.open(uploaded).convert("RGB")
-    img_np = np.array(image.resize((DISP_SIZE, DISP_SIZE)))
+    st.image(image, caption="Input Image")
 
     x = transform(image).unsqueeze(0).to(device)
 
-    # Prediction
     with torch.no_grad():
         out = model(x)
-        probs = F.softmax(out, dim=1)[0].cpu().numpy()
+        probs = F.softmax(out, dim=1).cpu().numpy()[0]
 
     pred = CLASS_NAMES[np.argmax(probs)]
-    conf = np.max(probs)*100
+    conf = np.max(probs) * 100
 
-    col1, col2 = st.columns(2)
+    st.success(f"Prediction: {pred}")
+    st.info(f"Confidence: {conf:.2f}%")
 
-    with col1:
-        st.image(image)
+    # ── GradCAM ──
+    cam_extractor = GradCAMPlusPlus(model, model.backbone.blocks[-1])
+    cam = cam_extractor.generate(x)
 
-    with col2:
-        st.markdown(f"## Prediction: {pred}")
-        st.markdown(f"## Confidence: {conf:.2f}%")
+    heatmap = cv2.applyColorMap(
+        np.uint8(255 * cam), cv2.COLORMAP_JET
+    )
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
 
-    # ── Explainability ─────────────────────────────
-    if pred != "healthy":
+    img_np = np.array(image.resize((DISP_SIZE, DISP_SIZE)))
+    overlay = cv2.addWeighted(img_np, 0.6, heatmap, 0.4, 0)
 
-        st.markdown("## 🔥 Explainability Maps")
+    st.image(overlay, caption="Grad-CAM Visualization")
 
-        gradcam = GradCAM(model)
-        cam1 = gradcam.generate(x)
-        gradcam.remove()
-
-        cam2 = score_cam(model, x, int(np.argmax(probs)), device)
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.image(to_heatmap(cam1), caption="Grad-CAM++")
-        with col2:
-            st.image(to_heatmap(cam2), caption="Score-CAM")
-
-        combined = (cam1 + cam2)/2
-        st.image(to_heatmap(combined), caption="Combined Attention")
-
-else:
-    st.info("Upload image to start detection")
+# ─────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────
+st.markdown("---")
+st.caption("EfficientNet-B4 + CBAM + GradCAM++")
