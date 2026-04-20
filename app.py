@@ -103,6 +103,8 @@ class Model(nn.Module):
 # ─────────────────────────────────────────────
 # LOAD MODEL FROM GOOGLE DRIVE
 # ─────────────────────────────────────────────
+import gdown
+
 MODEL_URL = "https://drive.google.com/uc?id=1ia7dHGbg7LP7Wj0GfubV3Kw0x_MnXhvl"
 
 @st.cache_resource
@@ -112,22 +114,18 @@ def load_model():
 
     model_path = "final_model.pth"
 
-    # Download if not exists
+    # ✅ Proper Google Drive download
     if not os.path.exists(model_path):
-        with st.spinner("📥 Downloading model... Please wait"):
-            r = requests.get(MODEL_URL, stream=True)
-            if r.status_code != 200:
-                st.error("❌ Failed to download model")
-                st.stop()
+        with st.spinner("📥 Downloading model..."):
+            gdown.download(MODEL_URL, model_path, quiet=False)
 
-            with open(model_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-
-    # Load weights
-    state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state, strict=False)
+    # ✅ Load safely
+    try:
+        state = torch.load(model_path, map_location=device)
+        model.load_state_dict(state, strict=False)
+    except Exception as e:
+        st.error("❌ Model loading failed. File may be corrupted.")
+        st.stop()
 
     model.to(device)
     model.eval()
